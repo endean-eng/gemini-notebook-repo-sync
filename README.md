@@ -197,7 +197,7 @@ jobs:
           fetch-depth: 1
 
       - name: Shard & Sync to Google Drive via Composite Action
-        uses: <YOUR_GITHUB_ORG_OR_USER>/<THIS_REPO_NAME>@<40_CHAR_COMMIT_SHA> # v1.0.0
+        uses: endean-eng/gemini-notebook-repo-sync@3c8d77fc8a045caffcfb778e80e7a1dc3ce0fc70 # v1.0.0
         with:
           gas-webhook-url: ${{ secrets.GAS_WEBHOOK_URL }}
           gas-webhook-secret: ${{ secrets.GAS_WEBHOOK_SECRET }}
