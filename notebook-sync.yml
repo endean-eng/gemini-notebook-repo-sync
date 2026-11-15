@@ -5,11 +5,13 @@ on:
     branches:
       - main
       - master
-  workflow_dispatch: # Allows manual 1-click trigger from the GitHub Actions tab
+  workflow_dispatch:
 
-# Least-privilege token scope: read-only access to repository contents
 permissions:
   contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 concurrency:
   group: notebook-drive-sync-${{ github.repository }}
@@ -26,18 +28,10 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: Set up Python 3.12
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
-        with:
-          python-version: "3.12"
-
       - name: Run Bottom-Up Shard Bundler & Push to GAS Webhook
         env:
           GAS_WEBHOOK_URL: ${{ secrets.GAS_WEBHOOK_URL }}
           GAS_WEBHOOK_SECRET: ${{ secrets.GAS_WEBHOOK_SECRET }}
-          # Optional overrides:
-          # MAX_SHARD_CHARS: "450000"
-          # MAX_SINGLE_FILE_BYTES: "350000"
         run: |
           if [ -f ".github/scripts/notebook-sync.py" ]; then
             python3 .github/scripts/notebook-sync.py
