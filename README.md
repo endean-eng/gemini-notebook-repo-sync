@@ -3,7 +3,7 @@
 **Zero-daemon, automated GitHub repository synchronization into native Google Docs for live context inside Gemini Notebooks (NotebookLM).**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](#license)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
+[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/)
 [![Dependencies: Zero](https://img.shields.io/badge/dependencies-zero%20(stdlib)-brightgreen.svg)](#supply-chain-minimalism--5-minute-auditability)
 [![Google Apps Script](https://img.shields.io/badge/Google%20Apps%20Script-V8-green.svg)](https://script.google.com/)
 
@@ -14,9 +14,9 @@
 Modern CI/CD utilities routinely pull dozens of transitive `pip` or `npm` packages just to walk a directory tree or send an HTTP request—introducing Dependabot churn and upstream supply-chain exposure into workflows that have read access to your source tree.
 
 This project is engineered around **strict supply-chain minimalism and deterministic verification**:
-* **Zero External Dependencies (`stdlib` Only):** `notebook-sync.py` uses 100% Python standard library modules (`hashlib`, `json`, `os`, `re`, `subprocess`, `urllib.request`, `pathlib`). No `pip install` step is ever executed.
-* **5-Minute Human Auditability:** The entire system consists of ~390 lines of Python (`notebook-sync.py`) and ~200 lines of Google Apps Script (`Code.gs`). A security or staff engineer can audit every line of code, network call, and file-system read in under 5 minutes.
-* **Least-Privilege CI Execution:** Runs strictly under `permissions: contents: read` with zero write access to your repository, packages, or pull requests, and binds all inputs via environment variables (`env:`) to eliminate shell-injection vectors.
+* **Zero External Dependencies (`stdlib` Only):** `notebook-sync.py` uses 100% Python standard library modules (`hashlib`, `json`, `os`, `random`, `re`, `subprocess`, `urllib.request`, `pathlib`) and runs natively on any Python 3.8+ interpreter. No `pip install` step is ever executed.
+* **5-Minute Human Auditability:** The entire system consists of ~470 lines of Python (`notebook-sync.py`) and ~240 lines of Google Apps Script (`GAS_web-app.js`). A security or staff engineer can audit every line of code, network call, and file-system read in under 5 minutes.
+* **Least-Privilege CI Execution:** Runs strictly under `permissions: contents: read` with zero write access to your repository, packages, or pull requests, skips all Git symlinks (`120000`) and submodules (`160000`), and binds all inputs via environment variables (`env:`) to eliminate shell-injection vectors.
 
 ---
 
@@ -37,9 +37,9 @@ flowchart TD
     Push["VS Code: git push"] --> GHA["GitHub Actions: notebook-sync.py"]
 
     subgraph Bundler ["1. Local Git Bundler & Compactor (GitHub Runner)"]
-        GHA --> GitIdx["Extract null-delimited index<br/>(git ls-files -s -z)"]
-        GitIdx --> RootIso["Isolate root files into 00-ROOT<br/>& compact leaf folders (<= 450k chars)"]
-        RootIso --> PostShard["Send 1 HTTP POST per shard<br/>(custom 302 redirect handler)"]
+        GHA --> GitIdx["Extract null-delimited index<br/>(git ls-files -s -z, skip symlinks)"]
+        GitIdx --> RootIso["Isolate 00-ROOT & coalesce leaf subtrees<br/>all-or-nothing (<= 450k chars)"]
+        RootIso --> PostShard["Send 1 HTTP POST per shard<br/>(exponential backoff & 302 handler)"]
     end
 
     PostShard --> GAS["Google Apps Script Web App (doPost)"]
@@ -61,34 +61,36 @@ flowchart TD
 
 | Physical / API Constraint | Architectural Decision | Rejected Alternative & Failure Mode | Safety Factor / Operational Bound |
 |---|---|---|---|
-| **Google Docs 1.02M Char Hard Cap & GAS 100MB V8 Heap** | Enforce `MAX_SHARD_CHARS = 450,000` (inclusive of header & manifest overhead) and transmit **1 HTTP `POST` per shard**. | Sending the entire repository in a single `doPost` JSON payload (50MB ingress limit), which exhausts the 100MB V8 heap during `JSON.parse`. | **2.26x safety margin** below the 1.02M char limit; keeps V8 UTF-16 string allocation under 5% of heap capacity and resets the 6-minute execution clock per shard. |
-| **GAS HTTP 302 Redirect Behavior (`urllib.request`)** | Custom `GASRedirectHandler` strips `Content-Type` on `*.googleusercontent.com` output redirects and blocks premature POST-dropping 302s. | Default `urllib.request.urlopen`, which retains `Content-Type: application/json` on redirected GETs (triggering 400/405 errors) or silently drops POST bodies on auth redirects. | **100% payload integrity** with explicit HTTP error body logging and non-JSON redirect detection. |
+| **Google Docs 1.02M Char Hard Cap & GAS 100MB V8 Heap** | Enforce `MAX_SHARD_CHARS = 450,000` (inclusive of dynamic header & manifest overhead), clamp `MAX_SINGLE_FILE_BYTES <= 0.85 * MAX_SHARD_CHARS`, and send **1 HTTP `POST` per shard**. | Sending the entire repository in a single `doPost` JSON payload (50MB ingress limit), which exhausts the 100MB V8 heap during `JSON.parse`. | **2.26x safety margin** below the 1.02M char limit; keeps V8 UTF-16 string allocation under 5% of heap capacity and resets the 6-minute execution clock per shard. |
+| **GAS HTTP 302 Redirects & Multi-Repo Script Lock Contention** | Custom `GASRedirectHandler` strips `Content-Type` on `*.googleusercontent.com` output redirects, paired with 4-attempt exponential backoff + jitter on HTTP `429/5xx` and GAS `503` lock timeouts. | Default `urllib.request.urlopen` (which retains `Content-Type` on redirected GETs or drops POST bodies) with zero retry on multi-repo lock contention. | **100% payload integrity** across concurrent Organization-wide repository pushes. |
 | **Drive API Mutation Latency & Notebook Link Persistence** | Stream `text/plain` media payloads into native Docs via Drive API v3 `Drive.Files.update`. | Mutating text via `DocumentApp.openById().getBody().setText()`, or deleting/re-creating files on each push. | **~800ms update latency** (vs. DOM parsing timeouts on >200KB files) while preserving the exact Google Drive `FILE_ID` linked in Gemini Notebook. |
-| **Storage Quota Ownership** | Deploy Apps Script Web App as `Execute as: Me` gated by a shared cryptographic secret. | Provisioning a GCP Service Account per repo or organization. | **Zero service-account quota traps**; avoids invisible 15GB Service Account Drive quota exhaustion (`storageQuotaExceeded`) and IAM key rotation. |
-| **RAG Context Isolation & Path Collision Prevention** | Unconditional `00-ROOT` isolation + smallest-first (`direct_chars` ASC) bottom-up leaf compaction using `__` hierarchy delimiters. | Naive `-` path flattening (where `src/core-utils` and `src/core/utils` collide) or alphabetical sibling merging (which starves small leaf folders). | **Zero path-flattening collisions**, zero empty Google Docs, and clean top-level module checkboxes (`00-ROOT`, `01-src`, `01-docs`) in Gemini Notebook. |
+| **Storage Quota Ownership** | Deploy Apps Script Web App as `Execute as: Me` gated by a constant-time verified secret (`timingSafeEqual_`). | Provisioning a GCP Service Account per repo or organization. | **Zero service-account quota traps**; avoids invisible 15GB Service Account Drive quota exhaustion (`storageQuotaExceeded`) and IAM key rotation. |
+| **RAG Context Stability & Case-Insensitive Drive Queries** | Unconditional `00-ROOT` isolation + **All-or-Nothing sibling subtree coalescing** + pre-sanitized, case-insensitive collision-free `__` shard keys. | Greedy pairwise sibling merging (which strands peer folders when two siblings fill the parent) or case-sensitive keys (which collide in Drive's case-insensitive `name =` query). | **Zero path or casing collisions**, symmetric peer module shards, and clean top-level checkboxes in Gemini Notebook. |
 
 ---
 
 ## Key Features
 
 * **Preserved Google Drive `FILE_ID`s:** Updates overwrite the body of existing native Google Docs in-place via Drive API v3 (`Drive.Files.update`), so your Gemini Notebook never loses its source link.
-* **Strict Root Isolation & Smallest-First Bottom-Up Compaction:**
+* **Strict Root Isolation & All-or-Nothing Sibling Compaction:**
   * Root-level files (`README.md`, `package.json`, configs) always stay isolated in their own `<repo>__00-ROOT` document, even if the entire repository is well under the character limit.
   * Pass-through directories containing only subdirectories (0 direct files) are pruned automatically and never create empty Google Docs.
-  * Deep subdirectories sort smallest-first (`direct_chars` ascending) at each depth and merge upward into their parent module until reaching the 450,000-character threshold (stopping at top-level directories like `src/`, `docs/`, or `tests/`), preventing large subfolders from starving small sibling folders and giving you clean checkboxes in the Gemini Notebook sidebar.
-  * Flattened shard names use double-underscore hierarchy separators (`01-src__core__utils`) so hyphenated folder names never collide.
+  * When a parent directory and **all** of its child subdirectories fit within 450,000 characters, the entire subtree coalesces cleanly into the parent shard. If the combined subtree exceeds 450,000 characters, substantial peer subdirectories (`>= 25,000` chars) remain standalone shards while tiny helper folders (`< 25,000` chars) merge into the parent—preventing sibling starvation and avoiding Google Doc ID churn when individual files grow.
+  * Flattened shard names are pre-sanitized and checked case-insensitively with double-underscore hierarchy separators (`01-src__core__utils`) and automatic SHA-256 disambiguation if two directories ever collide.
+* **Monorepo & Binary Hardening:** Automatically skips Git symlinks (`120000`), submodules (`160000`), nested build/virtualenv directories at any depth (`node_modules/`, `dist/`, `build/`, `.venv/`, `__pycache__/`), minified bundles (`.min.js`, `.min.css`, `.map`), and files containing null bytes anywhere in their payload.
 * **Dynamic N+1 Backtick Fence Escaping:** Inspects every source file for contiguous backtick sequences (`re.findall(r"`+", raw_text)`) and wraps the file in an outer fence of `max(3, max_run + 1)` backticks—ensuring Markdown files and scripts that contain triple or quadruple backticks never prematurely terminate their code block.
-* **Git Blob SHA-1 Delta Skipping:** Computes a deterministic composite hash from Git's null-delimited native index (`git ls-files -s -z`) and stores it in the Google Doc's `description` metadata. Unchanged shards are skipped in ~100ms without re-uploading document bodies.
-* **Safe Refactoring (`[STALE]` Flagging & Auto-Restore):** If you rename or delete a folder in your repo, orphaned Google Docs are automatically prefixed with `[STALE]` (paginated across folders of any size). If a `[STALE]` shard later becomes active again—even with identical file hashes—the `[STALE]` prefix is automatically stripped.
+* **Git Blob SHA-1 Delta Skipping:** Computes a deterministic composite hash (`FORMAT_VERSION` + `repo_name` + `shard_name` + member file `rel_path:git_blob_sha1`) and stores it in the Google Doc's `description` metadata. Unchanged shards are skipped in ~100ms without re-uploading document bodies.
+* **Safe Refactoring (`[STALE]` Flagging, Auto-Restore & Empty-Repo Sweep):** Orphaned Google Docs are prefixed with `[STALE]` (paginated across folders of any size), automatically restored if the folder becomes active again, and swept cleanly even if all eligible text files are removed from a repository.
 
 ---
 
 ## Repository Contents
 
-* `action.yml` (`action_yml.txt`) — Composite GitHub Action definition enabling 1-line `uses:` integration across multiple repositories.
-* `GAS_web-app.js` (`gas_webhook_receiver.txt`) — The Google Apps Script Web App receiver (`Code.gs`).
-* `notebook-sync.py` (`github_notebook_sync_py.txt`) — Zero-dependency Python 3 bundler and bottom-up directory sharding engine.
-* `notebook-sync.yml` (`github_workflow_sync_yml.txt`) — Drop-in GitHub Actions workflow template.
+* `action.yml` — Composite GitHub Action definition enabling 1-line `uses:` integration across multiple repositories.
+* `GAS_web-app.js` — The Google Apps Script Web App receiver (`Code.gs`).
+* `notebook-sync.py` — Zero-dependency Python 3 bundler and bottom-up directory sharding engine.
+* `notebook-sync.yml` — Drop-in GitHub Actions workflow template (supports both `.github/scripts/notebook-sync.py` and root `notebook-sync.py`).
+* `LICENSE` — MIT License.
 
 ---
 
@@ -109,7 +111,7 @@ You only perform this phase **once** across your entire Google account. All of y
    * Click **Add**. *(Without this step, `Drive.Files.create` and `Drive.Files.update` will fail with `ReferenceError: Drive is not defined`.)*
 
 3. **Paste the Webhook Code & Set Your Secret:**
-   * Copy the contents of `GAS_web-app.js` (`gas_webhook_receiver.txt`) and paste them into `Code.gs` (replacing the default `myFunction`).
+   * Copy the contents of `GAS_web-app.js` and paste them into `Code.gs` (replacing the default `myFunction`).
    * Generate a random secret token (for example, run `openssl rand -hex 24` in any terminal, or type a strong 32+ character passphrase).
    * Replace `"REPLACE_WITH_YOUR_SECRET_TOKEN"` on line 12 of `Code.gs` with your secret token:
      ```javascript
@@ -155,7 +157,7 @@ You can integrate the bundler into your repositories using either the **Composit
 
 | Criteria | Pattern A: Composite Action (`action.yml`) | Pattern B: Vendored Script (`notebook-sync.py`) |
 |---|---|---|
-| **How It Works** | GitHub runner checks out your target repo in `$GITHUB_WORKSPACE`, clones this tool repo into `${{ github.action_path }}`, sets up Python 3.12, and runs `notebook-sync.py` against your working tree. | You copy `notebook-sync.py` directly into `.github/scripts/notebook-sync.py` inside the target repository. |
+| **How It Works** | GitHub runner checks out your target repo in `$GITHUB_WORKSPACE`, clones this tool repo into `${{ github.action_path }}`, and runs `notebook-sync.py` using the runner's `python3` against your working tree. | You copy `notebook-sync.py` directly into `.github/scripts/notebook-sync.py` inside the target repository. |
 | **When to Use** | Best when syncing **multiple repositories** (avoids duplicating `notebook-sync.py` across 5–20 repos). | Best for **air-gapped / zero-external-action environments** or when customizing sharding rules for a single repo. |
 | **Supply-Chain Security** | Pin the `uses:` reference to a full **40-character commit SHA** so upstream tag mutations cannot affect your workflow. | 100% local to your repository; code only changes when you commit to that repo. |
 
@@ -186,7 +188,7 @@ concurrency:
 jobs:
   sync-to-drive:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 15
 
     steps:
       - name: Checkout Target Repository
@@ -243,7 +245,7 @@ your-repo/
    jobs:
      sync-to-drive:
        runs-on: ubuntu-latest
-       timeout-minutes: 5
+       timeout-minutes: 15
 
        steps:
          - name: Checkout Repository
@@ -260,7 +262,15 @@ your-repo/
            env:
              GAS_WEBHOOK_URL: ${{ secrets.GAS_WEBHOOK_URL }}
              GAS_WEBHOOK_SECRET: ${{ secrets.GAS_WEBHOOK_SECRET }}
-           run: python3 .github/scripts/notebook-sync.py
+           run: |
+             if [ -f ".github/scripts/notebook-sync.py" ]; then
+               python3 .github/scripts/notebook-sync.py
+             elif [ -f "notebook-sync.py" ]; then
+               python3 notebook-sync.py
+             else
+               echo "ERROR: notebook-sync.py not found." >&2
+               exit 1
+             fi
    ```
 
 2. **(Optional) Local Dry-Run Verification:**
@@ -303,7 +313,7 @@ your-repo/
 | `GAS_WEBHOOK_SECRET` | `gas-webhook-secret` | *(Required)* | Shared secret matching `SECRET_TOKEN` in `Code.gs`. |
 | `REPO_NAME` | `repo-name` | Auto-detected | Overrides the subfolder and document prefix name in Google Drive (defaults to the GitHub repository name). |
 | `MAX_SHARD_CHARS` | `max-shard-chars` | `450000` | Maximum character ceiling per Google Doc shard (2.26x safety margin below Google Docs' 1.02M character limit, inclusive of header & manifest overhead). |
-| `MAX_SINGLE_FILE_BYTES` | `max-single-file-bytes` | `350000` | Skips individual oversized text/data files exceeding this byte threshold. |
+| `MAX_SINGLE_FILE_BYTES` | `max-single-file-bytes` | `350000` | Skips individual oversized text/data files exceeding this byte threshold (automatically clamped to `<= 85%` of `MAX_SHARD_CHARS`). |
 | `DRY_RUN` | `dry-run` | `false` | Set to `true` to compute shards and print stats locally without calling the webhook. |
 
 ---
