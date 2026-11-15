@@ -510,10 +510,11 @@ class GASRedirectHandler(urllib.request.HTTPRedirectHandler):
     """
     Custom redirect handler for Google Apps Script Web Apps:
     1. Converts post-`doPost` 302 redirects to `*.googleusercontent.com` into clean
-       GET requests with `Content-Type` and `Content-Length` removed.
+       GET requests without `Host`, `Content-Type`, or `Content-Length` carryover.
     2. Rejects any other 301/302/303 redirect on a POST request to prevent silent
        POST body stripping on misconfigured `/dev` or OAuth URLs.
     """
+
     def redirect_request(
         self,
         req: urllib.request.Request,
@@ -528,14 +529,10 @@ class GASRedirectHandler(urllib.request.HTTPRedirectHandler):
 
         if code in (301, 302, 303) and req.get_method() == "POST":
             if host.endswith("googleusercontent.com"):
-                clean_headers: Dict[str, str] = {
-                    k: v for k, v in req.header_items()
-                    if k.lower() not in ("content-type", "content-length")
-                }
                 return urllib.request.Request(
                     newurl,
                     data=None,
-                    headers=clean_headers,
+                    headers={"User-Agent": "gemini-notebook-repo-sync/1.0"},
                     method="GET"
                 )
             raise urllib.error.URLError(
