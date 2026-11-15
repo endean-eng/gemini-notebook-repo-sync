@@ -19,10 +19,25 @@ const MASTER_FOLDER_NAME = "Gemini-Notebook-Mirrors";
  */
 function doPost(e) {
   const lock = LockService.getScriptLock();
-  // Wait up to 30 seconds for concurrent shard requests to finish folder creation
-  lock.waitLock(30000);
+  let hasLock = false;
 
   try {
+    // Acquire concurrency lock inside try/catch so timeouts return JSON 503 instead of HTML
+    hasLock = lock.tryLock(30000);
+    if (!hasLock) {
+      return jsonResponse_({
+        status: 503,
+        error: "Server busy: Could not acquire script lock within 30s"
+      });
+    }
+
+    if (!SECRET_TOKEN || SECRET_TOKEN === "REPLACE_WITH_YOUR_SECRET_TOKEN") {
+      return jsonResponse_({
+        status: 500,
+        error: "Server misconfigured: Default SECRET_TOKEN placeholder has not been replaced in Code.gs"
+      });
+    }
+
     if (!e || !e.postData || !e.postData.contents) {
       return jsonResponse_({ status: 400, error: "Empty request body" });
     }
@@ -32,6 +47,7 @@ function doPost(e) {
       return jsonResponse_({ status: 403, error: "Unauthorized: Invalid secret token" });
     }
 
+    const masterFolderName = sanitizeName_(MASTER_FOLDER_NAME);
     const repo = sanitizeName_(payload.repo || "unknown-repo");
     const shardName = sanitizeName_(payload.shardName || "00-ROOT");
     const content = payload.content || "";
@@ -39,7 +55,7 @@ function doPost(e) {
     const activeShards = payload.activeShards || null;
 
     // 1. Ensure Master Folder and Repo Subfolder exist
-    const masterFolderId = findOrCreateFolder_("root", MASTER_FOLDER_NAME);
+    const masterFolderId = findOrCreateFolder_("root", masterFolderName);
     const repoFolderId = findOrCreateFolder_(masterFolderId, repo);
 
     // 2. Check if the Native Google Doc for this shard already exists
@@ -49,12 +65,19 @@ function doPost(e) {
     // 3. Fast-Path Delta Skip: If the existing doc's description already holds the
     //    exact same composite Git tree/blob hash, skip the Drive media upload!
     if (existingDoc && shardHash && existingDoc.description === `git-shard-hash:${shardHash}`) {
+      let skipAction = "skipped_unchanged";
+      // If this shard was previously marked [STALE] and has now been restored with
+      // identical contents, strip the [STALE] prefix so it becomes active again.
+      if (existingDoc.name !== docTitle) {
+        Drive.Files.update({ name: docTitle }, existingDoc.id);
+        skipAction = "restored_from_stale";
+      }
       if (Array.isArray(activeShards)) {
         flagStaleShards_(repoFolderId, repo, activeShards);
       }
       return jsonResponse_({
         status: 200,
-        action: "skipped_unchanged",
+        action: skipAction,
         repo: repo,
         shardName: shardName,
         fileId: existingDoc.id,
@@ -104,16 +127,26 @@ function doPost(e) {
       stack: err.stack || ""
     });
   } finally {
-    lock.releaseLock();
+    if (hasLock) {
+      lock.releaseLock();
+    }
   }
+}
+
+/**
+ * Escapes backslashes and single quotes for Google Drive API v3 query strings.
+ */
+function escapeDriveQueryLiteral_(str) {
+  return String(str).replace(/\\/g, "\\\\").replace(/'/g, "\\'");
 }
 
 /**
  * Finds or creates a subfolder inside a given parent folder ID.
  */
 function findOrCreateFolder_(parentId, folderName) {
-  const escapedName = folderName.replace(/'/g, "\\'");
-  const query = `'${parentId}' in parents and name = '${escapedName}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false`;
+  const escapedParent = escapeDriveQueryLiteral_(parentId);
+  const escapedName = escapeDriveQueryLiteral_(folderName);
+  const query = `'${escapedParent}' in parents and name = '${escapedName}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false`;
   const res = Drive.Files.list({
     q: query,
     fields: "files(id, name)",
@@ -136,9 +169,10 @@ function findOrCreateFolder_(parentId, folderName) {
  * Finds a native Google Doc inside a folder (also matches if previously marked [STALE]).
  */
 function findDocInFolder_(folderId, docTitle) {
-  const escapedTitle = docTitle.replace(/'/g, "\\'");
-  const staleTitle = `[STALE] ${docTitle}`.replace(/'/g, "\\'");
-  const query = `'${folderId}' in parents and (name = '${escapedTitle}' or name = '${staleTitle}') and mimeType = 'application/vnd.google-apps.document' and trashed = false`;
+  const escapedFolder = escapeDriveQueryLiteral_(folderId);
+  const escapedTitle = escapeDriveQueryLiteral_(docTitle);
+  const staleTitle = escapeDriveQueryLiteral_(`[STALE] ${docTitle}`);
+  const query = `'${escapedFolder}' in parents and (name = '${escapedTitle}' or name = '${staleTitle}') and mimeType = 'application/vnd.google-apps.document' and trashed = false`;
   const res = Drive.Files.list({
     q: query,
     fields: "files(id, name, description)",
@@ -153,23 +187,32 @@ function findDocInFolder_(folderId, docTitle) {
 
 /**
  * Marks any Google Docs in the repo folder that are no longer part of activeShards as [STALE].
- * Preserves the file rather than deleting it so Notebook links don't silently break without notice.
+ * Paginates across all files in the folder and preserves orphaned docs rather than deleting
+ * them so Notebook links never silently break without notice.
  */
 function flagStaleShards_(folderId, repo, activeShards) {
   const validTitles = new Set(activeShards.map(s => `${repo}__${sanitizeName_(s)}`));
-  const query = `'${folderId}' in parents and mimeType = 'application/vnd.google-apps.document' and trashed = false`;
-  const res = Drive.Files.list({
-    q: query,
-    fields: "files(id, name)",
-    pageSize: 100
-  });
+  const escapedFolder = escapeDriveQueryLiteral_(folderId);
+  const query = `'${escapedFolder}' in parents and mimeType = 'application/vnd.google-apps.document' and trashed = false`;
 
-  if (!res.files) return;
-  for (const file of res.files) {
-    if (!validTitles.has(file.name) && !file.name.startsWith("[STALE] ")) {
-      Drive.Files.update({ name: `[STALE] ${file.name}` }, file.id);
+  let pageToken = null;
+  do {
+    const res = Drive.Files.list({
+      q: query,
+      fields: "nextPageToken, files(id, name)",
+      pageSize: 1000,
+      pageToken: pageToken
+    });
+
+    if (res.files) {
+      for (const file of res.files) {
+        if (!validTitles.has(file.name) && !file.name.startsWith("[STALE] ")) {
+          Drive.Files.update({ name: `[STALE] ${file.name}` }, file.id);
+        }
+      }
     }
-  }
+    pageToken = res.nextPageToken || null;
+  } while (pageToken);
 }
 
 function sanitizeName_(str) {
