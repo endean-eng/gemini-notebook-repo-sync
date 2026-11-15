@@ -1,0 +1,43 @@
+name: "Gemini Notebook Repo Sync"
+description: "Shards Git-tracked source files into native Google Docs for live Gemini Notebook syncing."
+branding:
+  icon: "book-open"
+  color: "blue"
+
+inputs:
+  gas-webhook-url:
+    description: "Deployed Google Apps Script Web App exec URL"
+    required: true
+  gas-secret-token:
+    description: "Shared secret token matching SECRET_TOKEN in Code.gs"
+    required: true
+  repo-name:
+    description: "Override target subfolder name in Google Drive (defaults to repo slug)"
+    required: false
+    default: "${{ github.event.repository.name }}"
+  max-shard-chars:
+    description: "Hard character ceiling per Google Doc shard"
+    required: false
+    default: "450000"
+  dry-run:
+    description: "Set to true to compute shards and hashes without network calls"
+    required: false
+    default: "false"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Run Bottom-Up Compactor and Sync Shards
+      shell: bash
+      env:
+        GAS_WEBHOOK_URL: ${{ inputs.gas-webhook-url }}
+        GAS_SECRET_TOKEN: ${{ inputs.gas-secret-token }}
+        REPO_NAME: ${{ inputs.repo-name }}
+        MAX_SHARD_CHARS: ${{ inputs.max-shard-chars }}
+        INPUT_DRY_RUN: ${{ inputs.dry-run }}
+      run: |
+        ARGS=()
+        if [ "$INPUT_DRY_RUN" = "true" ]; then
+          ARGS+=("--dry-run")
+        fi
+        python3 "${{ github.action_path }}/notebook-sync.py" "${ARGS[@]}"
