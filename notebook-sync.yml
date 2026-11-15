@@ -1,0 +1,37 @@
+name: Sync Repo to Gemini Notebook (Google Drive)
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch: # Allows manual 1-click trigger from the GitHub Actions tab
+
+concurrency:
+  group: notebook-drive-sync-${{ github.repository }}
+  cancel-in-progress: true
+
+jobs:
+  sync-to-drive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run Bottom-Up Shard Bundler & Push to GAS Webhook
+        env:
+          GAS_WEBHOOK_URL: ${{ secrets.GAS_WEBHOOK_URL }}
+          GAS_WEBHOOK_SECRET: ${{ secrets.GAS_WEBHOOK_SECRET }}
+          # Optional overrides:
+          # MAX_SHARD_CHARS: "450000"
+          # MAX_SINGLE_FILE_BYTES: "350000"
+        run: python3 .github/scripts/notebook-sync.py
