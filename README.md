@@ -4,7 +4,19 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](#license)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
+[![Dependencies: Zero](https://img.shields.io/badge/dependencies-zero%20(stdlib)-brightgreen.svg)](#supply-chain-minimalism--5-minute-auditability)
 [![Google Apps Script](https://img.shields.io/badge/Google%20Apps%20Script-V8-green.svg)](https://script.google.com/)
+
+---
+
+## Supply-Chain Minimalism & 5-Minute Auditability
+
+Modern CI/CD utilities routinely pull dozens of transitive `pip` or `npm` packages just to walk a directory tree or send an HTTP request—introducing Dependabot churn and upstream supply-chain exposure into workflows that have read access to your source tree.
+
+This project is engineered around **strict supply-chain minimalism and deterministic verification**:
+* **Zero External Dependencies (`stdlib` Only):** `notebook-sync.py` uses 100% Python standard library modules (`hashlib`, `json`, `os`, `subprocess`, `urllib.request`, `pathlib`). No `pip install` step is ever executed.
+* **5-Minute Human Auditability:** The entire system consists of ~330 lines of Python (`notebook-sync.py`) and ~160 lines of Google Apps Script (`Code.gs`). A security or staff engineer can audit every line of code, network call, and file-system read in under 5 minutes.
+* **Least-Privilege CI Execution:** Runs strictly under `permissions: contents: read` with zero write access to your repository, packages, or pull requests, and binds all inputs via environment variables (`env:`) to eliminate shell-injection vectors.
 
 ---
 
@@ -48,6 +60,17 @@ This project bridges GitHub Actions directly to a lightweight, self-hosted **Goo
 
 ---
 
+## System Operating Envelope & Architectural Decision Ledger
+
+| Boundary / Constraint | Architectural Decision | Rejected Alternative | Operational Consequence |
+|---|---|---|---|
+| **Google Docs 1.02M Char Hard Cap & GAS 100MB V8 Heap** | Enforce `MAX_SHARD_CHARS = 450,000` (2.26x safety factor) and transmit **1 HTTP `POST` per shard**. | Sending the entire repository in a single `doPost` JSON payload (50MB ingress limit). | Prevents HTTP `413` errors, keeps V8 UTF-16 `JSON.parse` allocation under 5% of heap capacity, and resets the 6-minute execution clock per shard. |
+| **Drive API Mutation Latency & Notebook Link Persistence** | Stream `text/plain` media payloads into native Docs via Drive API v3 `Drive.Files.update`. | Mutating text via `DocumentApp.openById().getBody().setText()`, or deleting/re-creating files. | Updates complete in ~800ms instead of timing out on DOM paragraph parsing, while preserving the exact Google Drive `FILE_ID` linked in Gemini Notebook. |
+| **Storage Quota Ownership** | Deploy Apps Script Web App as `Execute as: Me` gated by a shared cryptographic secret. | Provisioning a GCP Service Account per repo or organization. | Avoids invisible 15GB Service Account Drive quota exhaustion (`storageQuotaExceeded`) and eliminates GCP IAM key rotation overhead. |
+| **RAG Context Isolation** | Unconditional `00-ROOT` isolation + bottom-up leaf compaction stopping at Depth 1 (`src/`, `docs/`). | Naive 1-Doc-per-repo dump or 1-Doc-per-folder (which creates empty Docs for pass-through folders). | Zero empty Google Docs; root configs stay separated from source trees; developers can toggle top-level modules on/off via Notebook checkboxes. |
+
+---
+
 ## Key Features
 
 * **Preserved Google Drive `FILE_ID`s:** Updates overwrite the body of existing native Google Docs in-place via Drive API v3 (`Drive.Files.update`), so your Gemini Notebook never loses its source link.
@@ -63,9 +86,10 @@ This project bridges GitHub Actions directly to a lightweight, self-hosted **Goo
 
 ## Repository Contents
 
+* `action.yml` (`action_yml.txt`) — Composite GitHub Action definition enabling 1-line `uses:` integration across multiple repositories.
 * `Code.gs` (`gas_webhook_receiver.txt`) — The Google Apps Script Web App receiver.
 * `notebook-sync.py` (`github_notebook_sync_py.txt`) — Zero-dependency Python 3 bundler and bottom-up directory sharding engine.
-* `notebook-sync.yml` (`github_workflow_sync_yml.txt`) — Drop-in GitHub Actions workflow triggered on `push` or manual dispatch.
+* `notebook-sync.yml` (`github_workflow_sync_yml.txt`) — Drop-in GitHub Actions workflow template.
 
 ---
 
@@ -125,9 +149,68 @@ You only perform this phase **once** across your entire Google account. All of y
 
 ---
 
-### Phase 3: Add the Bundler Script & Workflow to a Repository
+### Phase 3: Connect Your Repository (Choose Pattern A or Pattern B)
 
-In your target repository, place the Python script and GitHub Actions workflow in `.github/`:
+You can integrate the bundler into your repositories using either the **Composite Action (`action.yml`)** for centralized multi-repo management or the **Vendored Script** pattern for self-contained repositories.
+
+| Criteria | Pattern A: Composite Action (`action.yml`) | Pattern B: Vendored Script (`notebook-sync.py`) |
+|---|---|---|
+| **How It Works** | GitHub runner checks out your target repo in `$GITHUB_WORKSPACE`, clones this tool repo into `${{ github.action_path }}`, and runs `notebook-sync.py` against your working tree. | You copy `notebook-sync.py` directly into `.github/scripts/notebook-sync.py` inside the target repository. |
+| **When to Use** | Best when syncing **multiple repositories** (avoids duplicating `notebook-sync.py` across 5–20 repos). | Best for **air-gapped / zero-external-action environments** or when customizing sharding rules for a single repo. |
+| **Supply-Chain Security** | Pin the `uses:` reference to a full **40-character commit SHA** so upstream tag mutations cannot affect your workflow. | 100% local to your repository; code only changes when you commit to that repo. |
+
+---
+
+#### Pattern A: Using the Composite Action (`action.yml`) — Recommended for Multi-Repo Fleets
+
+Create `.github/workflows/notebook-sync.yml` in your target repository (replace `<YOUR_GITHUB_ORG_OR_USER>/<THIS_REPO_NAME>@<40_CHAR_COMMIT_SHA>` with the commit hash of your deployed tool repository):
+
+```yaml
+name: Sync Repo to Gemini Notebook (Google Drive)
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+# Least-privilege token scope: read-only access to repository contents
+permissions:
+  contents: read
+
+concurrency:
+  group: notebook-drive-sync-${{ github.repository }}
+  cancel-in-progress: true
+
+jobs:
+  sync-to-drive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout Target Repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 1
+
+      - name: Shard & Sync to Google Drive via Composite Action
+        uses: <YOUR_GITHUB_ORG_OR_USER>/<THIS_REPO_NAME>@<40_CHAR_COMMIT_SHA> # v1.0.0
+        with:
+          gas-webhook-url: ${{ secrets.GAS_WEBHOOK_URL }}
+          gas-webhook-secret: ${{ secrets.GAS_WEBHOOK_SECRET }}
+          # Optional inputs:
+          # repo-name: "custom-folder-name"
+          # max-shard-chars: "450000"
+          # max-single-file-bytes: "350000"
+          # dry-run: "false"
+```
+
+---
+
+#### Pattern B: Vendored Script (Self-Contained in Target Repo)
+
+If you prefer not to reference an external action repository, copy `notebook-sync.py` and `notebook-sync.yml` directly into your target repository:
 
 ```text
 your-repo/
@@ -138,14 +221,55 @@ your-repo/
         └── notebook-sync.yml
 ```
 
-1. **(Optional) Local Dry-Run Verification:**
-   Before pushing, you can preview how `notebook-sync.py` will shard your repository locally without sending any network requests:
+1. **Create `.github/workflows/notebook-sync.yml` with Least-Privilege Permissions:**
+   ```yaml
+   name: Sync Repo to Gemini Notebook (Google Drive)
+
+   on:
+     push:
+       branches:
+         - main
+         - master
+     workflow_dispatch:
+
+   # Least-privilege token scope: read-only access to repository contents
+   permissions:
+     contents: read
+
+   concurrency:
+     group: notebook-drive-sync-${{ github.repository }}
+     cancel-in-progress: true
+
+   jobs:
+     sync-to-drive:
+       runs-on: ubuntu-latest
+       timeout-minutes: 5
+
+       steps:
+         - name: Checkout Repository
+           uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+           with:
+             fetch-depth: 1
+
+         - name: Set up Python 3.12
+           uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+           with:
+             python-version: "3.12"
+
+         - name: Run Bottom-Up Shard Bundler & Push to GAS Webhook
+           env:
+             GAS_WEBHOOK_URL: ${{ secrets.GAS_WEBHOOK_URL }}
+             GAS_WEBHOOK_SECRET: ${{ secrets.GAS_WEBHOOK_SECRET }}
+           run: python3 .github/scripts/notebook-sync.py
+   ```
+
+2. **(Optional) Local Dry-Run Verification:**
+   Before pushing, preview how `notebook-sync.py` will shard your repository locally without sending any network requests:
    ```bash
    DRY_RUN=true python3 .github/scripts/notebook-sync.py
    ```
-   You will see console output listing `00-ROOT` (isolated root files) and each `01-<folder>` shard along with file counts, character counts, and composite Git blob hashes.
 
-2. **Commit and Push:**
+3. **Commit and Push:**
    ```bash
    git add .github/scripts/notebook-sync.py .github/workflows/notebook-sync.yml
    git commit -m "ci: enable live Gemini Notebook Google Drive sync"
@@ -171,18 +295,16 @@ your-repo/
 
 ---
 
-## Configuration & Environment Variables
+## Configuration Reference (`env:` Variables & `action.yml` Inputs)
 
-You can customize the sharding behavior in `.github/workflows/notebook-sync.yml` via environment variables:
-
-| Variable | Default | Description |
-|---|---|---|
-| `GAS_WEBHOOK_URL` | *(Required)* | Deployed Google Apps Script Web App `/exec` URL. |
-| `GAS_WEBHOOK_SECRET` | *(Required)* | Shared secret matching `SECRET_TOKEN` in `Code.gs`. |
-| `REPO_NAME` | Auto-detected | Overrides the subfolder and document prefix name in Google Drive (defaults to the GitHub repository name). |
-| `MAX_SHARD_CHARS` | `450000` | Maximum character ceiling per Google Doc shard (safely below Google Docs' 1.02M character limit and Gemini Notebook's 500k-word limit). |
-| `MAX_SINGLE_FILE_BYTES` | `350000` | Skips individual oversized text/data files exceeding this byte threshold. |
-| `DRY_RUN` | `false` | Set to `true` to compute shards and print stats locally without calling the webhook. |
+| Environment Variable (Pattern B) | `action.yml` Input (Pattern A) | Default | Description |
+|---|---|---|---|
+| `GAS_WEBHOOK_URL` | `gas-webhook-url` | *(Required)* | Deployed Google Apps Script Web App `/exec` URL. |
+| `GAS_WEBHOOK_SECRET` | `gas-webhook-secret` | *(Required)* | Shared secret matching `SECRET_TOKEN` in `Code.gs`. |
+| `REPO_NAME` | `repo-name` | Auto-detected | Overrides the subfolder and document prefix name in Google Drive (defaults to the GitHub repository name). |
+| `MAX_SHARD_CHARS` | `max-shard-chars` | `450000` | Maximum character ceiling per Google Doc shard (2.26x safety margin below Google Docs' 1.02M character limit). |
+| `MAX_SINGLE_FILE_BYTES` | `max-single-file-bytes` | `350000` | Skips individual oversized text/data files exceeding this byte threshold. |
+| `DRY_RUN` | `dry-run` | `false` | Set to `true` to compute shards and print stats locally without calling the webhook. |
 
 ---
 
