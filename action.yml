@@ -1,43 +1,54 @@
-name: "Gemini Notebook Repo Sync"
-description: "Shards Git-tracked source files into native Google Docs for live Gemini Notebook syncing."
+name: "Live GitHub-to-Gemini Notebook Sync"
+description: "Zero-dependency Git repository sharder and native Google Doc sync engine for Gemini Notebooks (NotebookLM)."
 branding:
   icon: "book-open"
   color: "blue"
 
 inputs:
   gas-webhook-url:
-    description: "Deployed Google Apps Script Web App exec URL"
+    description: "Deployed Google Apps Script Web App /exec URL"
     required: true
-  gas-secret-token:
+  gas-webhook-secret:
     description: "Shared secret token matching SECRET_TOKEN in Code.gs"
     required: true
   repo-name:
-    description: "Override target subfolder name in Google Drive (defaults to repo slug)"
+    description: "Optional override for the subfolder and doc prefix in Google Drive (defaults to repository name)"
     required: false
-    default: "${{ github.event.repository.name }}"
+    default: ""
   max-shard-chars:
-    description: "Hard character ceiling per Google Doc shard"
+    description: "Maximum character ceiling per Google Doc shard"
     required: false
     default: "450000"
+  max-single-file-bytes:
+    description: "Maximum byte threshold for a single tracked text file"
+    required: false
+    default: "350000"
   dry-run:
-    description: "Set to true to compute shards and hashes without network calls"
+    description: "Set to true to compute shards and hashes without calling the GAS webhook"
     required: false
     default: "false"
 
 runs:
   using: "composite"
   steps:
-    - name: Run Bottom-Up Compactor and Sync Shards
+    - name: Set up Python 3.12
+      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+      with:
+        python-version: "3.12"
+
+    - name: Run Bottom-Up Shard Bundler & Push to GAS Webhook
       shell: bash
       env:
         GAS_WEBHOOK_URL: ${{ inputs.gas-webhook-url }}
-        GAS_SECRET_TOKEN: ${{ inputs.gas-secret-token }}
+        GAS_WEBHOOK_SECRET: ${{ inputs.gas-webhook-secret }}
         REPO_NAME: ${{ inputs.repo-name }}
         MAX_SHARD_CHARS: ${{ inputs.max-shard-chars }}
-        INPUT_DRY_RUN: ${{ inputs.dry-run }}
+        MAX_SINGLE_FILE_BYTES: ${{ inputs.max-single-file-bytes }}
+        DRY_RUN: ${{ inputs.dry-run }}
       run: |
-        ARGS=()
-        if [ "$INPUT_DRY_RUN" = "true" ]; then
-          ARGS+=("--dry-run")
+        if [ -f "${{ github.action_path }}/notebook-sync.py" ]; then
+          SCRIPT_PATH="${{ github.action_path }}/notebook-sync.py"
+        else
+          SCRIPT_PATH="${{ github.action_path }}/.github/scripts/notebook-sync.py"
         fi
-        python3 "${{ github.action_path }}/notebook-sync.py" "${ARGS[@]}"
+        python3 "$SCRIPT_PATH"
